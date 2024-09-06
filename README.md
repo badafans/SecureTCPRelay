@@ -22,11 +22,15 @@ go build
 ```
 
 ## 使用
-
 启动代理服务器并配置监听地址、转发目标地址、允许的 IP 范围和域名列表：
 
+> 直接使用
 ```bash
 ./SecureTCPRelay -src <local-address> -dst <forward-addresses> -cidr <allowed-cidrs> -domain <allowed-domains>
+```
+> 使用Docker
+```bash 
+docker run --name <container-name> -host -d sxhoio/securetcprelay -src <local-address> -dst <forward-addresses> -cidr <allowed-cidrs> -domain <allowed-domains>
 ```
 
 - `-src`: 本地监听的 IP 和端口（默认 `0.0.0.0:1234`）。
@@ -34,12 +38,17 @@ go build
 - `-cidr`: 允许的来源 IP 范围 (CIDR)，多个范围用逗号分隔（默认 `0.0.0.0/0,::/0`）。
 - `-domain`: 允许的域名列表，支持通配符，多个域名用逗号分隔（默认 `*` 表示 TCP 转发模式）。
 
-### 示例
+#### 示例
 
 要在 `0.0.0.0:8080` 上监听并将流量转发到 `192.168.1.100:80` 和 `192.168.1.100:443`，同时允许来自 `192.168.1.0/24` 的 IP 并允许访问 `abc.com` 和 `*.example.org` 的域名，你可以使用以下命令：
 
+> 直接运行
 ```bash
 ./SecureTCPRelay -src 0.0.0.0:8080 -dst 192.168.1.100:80,192.168.1.100:443 -cidr 192.168.1.0/24 -domain abc.com,*.example.org
+```
+> 使用Docker
+```bash
+docker run --name securetcprelay -host -d sxhoio/securetcprelay -src 0.0.0.0:8080 -dst 192.168.1.100:80,192.168.1.100:443 -cidr 192.168.1.0/24 -domain abc.com,*.example.org
 ```
 非TLS（HTTP & WS）的请求将被转发到 `192.168.1.100:80` ，TLS（HTTPS & WSS）的请求将被转发到 `192.168.1.100:443` 
 
