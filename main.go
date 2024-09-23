@@ -9,14 +9,12 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net"
 	"net/http"
 	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 var activeConnections int32 // 用于跟踪活跃连接的数量
@@ -24,9 +22,9 @@ var activeConnections int32 // 用于跟踪活跃连接的数量
 func main() {
 	// 解析命令行参数
 	localAddr := flag.String("src", "0.0.0.0:1234", "本地监听的 IP 和端口")
-	forwardAddrs := flag.String("dst", "127.0.0.1:4321", "转发的目标 IP 和端口,用逗号分隔,域名匹配模式下(默认第一个是非TLS地址,第二个是TLS地址,多出地址不生效),TCP模式下随机转发")
+	forwardAddrs := flag.String("dst", "127.0.0.1:4321", "转发的目标 IP 和端口,多目标模式用逗号分隔(第一个是非TLS地址,第二个是TLS地址,多出部分地址无效)")
 	cidrs := flag.String("cidr", "0.0.0.0/0,::/0", "允许的来源 IP 范围 (CIDR),多个范围用逗号分隔")
-	domainList := flag.String("domain", "*", "允许的域名列表,用逗号分隔,支持通配符,默认唯一参数*是TCP转发模式")
+	domainList := flag.String("domain", "*", "允许的域名列表,用逗号分隔,支持通配符*,默认转发所有域名")
 	flag.Parse()
 
 	// 解析多个 CIDR 范围
@@ -102,30 +100,6 @@ func handleConnection(conn net.Conn, destAddrs []string, allowedDomains []string
 		conn.Close()
 	}()
 
-	// 如果只有一个目标地址，无论是 TLS 还是非 TLS 数据，都转发到这个地址
-	if len(destAddrs) == 1 {
-		forwardAddr := destAddrs[0]
-		buf := make([]byte, 1024)
-		n, err := conn.Read(buf)
-		if err != nil {
-			log.Printf("读取连接数据时发生错误: %v", err)
-			return
-		}
-
-		if n > 0 && buf[0] == 0x16 { // 判断是否是TLS握手开始的第一个字节
-			handleHTTPS(conn, forwardAddr, allowedDomains, buf[:n])
-		} else {
-			// 非 TLS 数据，无论如何都转发到唯一目标地址
-			if len(destAddrs) > 1 && allowedDomains[0] == "*" {
-				rand.Seed(time.Now().UnixNano())
-				forwardAddr = destAddrs[rand.Intn(len(destAddrs))]
-			}
-			handleHTTP(conn, forwardAddr, allowedDomains, buf[:n])
-		}
-		return
-	}
-
-	// 读取前几个字节判断是否是TLS请求
 	buf := make([]byte, 1024)
 	n, err := conn.Read(buf)
 	if err != nil {
@@ -133,25 +107,27 @@ func handleConnection(conn net.Conn, destAddrs []string, allowedDomains []string
 		return
 	}
 
-	// 根据数据类型选择目标地址
 	var forwardAddr string
 	if n > 0 && buf[0] == 0x16 { // 判断是否是TLS握手开始的第一个字节
-		// TLS 数据，使用第二个目标地址（如果存在）
-		if len(destAddrs) < 2 {
-			log.Printf("TLS 数据接收时目标地址不足")
+		// TLS 数据处理
+		if len(destAddrs) >= 2 {
+			forwardAddr = destAddrs[1] // 使用第二个地址
+		} else if len(destAddrs) == 1 {
+			forwardAddr = destAddrs[0] // 只有一个地址也可以使用
+		} else {
 			return
 		}
-		forwardAddr = destAddrs[1]
+		log.Printf("转发 TLS 数据到: %s", forwardAddr) // 显示转发地址
 		handleHTTPS(conn, forwardAddr, allowedDomains, buf[:n])
 	} else {
-		// 非 TLS 数据，随机选择一个目标地址（如果有多个）
-		if len(destAddrs) > 1 && allowedDomains[0] == "*" {
-			rand.Seed(time.Now().UnixNano())
-			forwardAddr = destAddrs[rand.Intn(len(destAddrs))]
+		// HTTP 数据处理
+		if len(destAddrs) > 0 {
+			forwardAddr = destAddrs[0]                 // 使用第一个地址
+			log.Printf("转发 非TLS 数据到: %s", forwardAddr) // 显示转发地址
+			handleHTTP(conn, forwardAddr, allowedDomains, buf[:n])
 		} else {
-			forwardAddr = destAddrs[0]
+			return
 		}
-		handleHTTP(conn, forwardAddr, allowedDomains, buf[:n])
 	}
 }
 
@@ -248,23 +224,20 @@ func handleTCPForward(clientConn, serverConn net.Conn) {
 }
 
 func isAllowedDomain(host string, allowedDomains []string) bool {
-	if len(allowedDomains) == 0 || (len(allowedDomains) == 1 && allowedDomains[0] == "*") {
-		return true // 如果允许列表为空或只包含 "*"，则允许所有域名
+	if len(allowedDomains) == 1 && allowedDomains[0] == "*" {
+		return true
 	}
 
 	for _, pattern := range allowedDomains {
-		if pattern == "*" {
-			return true // 允许所有域名
-		}
 		if matchDomain(host, pattern) {
 			return true
 		}
 	}
+
 	return false
 }
 
 func matchDomain(host, pattern string) bool {
-	// 将模式转换为正则表达式
 	regexPattern := strings.Replace(pattern, ".", "\\.", -1)
 	regexPattern = strings.Replace(regexPattern, "*", ".*", -1)
 	regexPattern = "^" + regexPattern + "$"
