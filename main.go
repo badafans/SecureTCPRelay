@@ -171,7 +171,7 @@ func handleHTTP(conn net.Conn, forwardAddr string, allowedDomains []string, init
 
 func handleHTTPS(conn net.Conn, forwardAddr string, allowedDomains []string, initialData []byte) {
 	// 读取 TLS ClientHello 消息
-	clientHello, err := readClientHello(initialData)
+	clientHello, fullHello, err := readClientHello(conn, initialData)
 	if err != nil {
 		log.Printf("读取 ClientHello 时发生错误: %v", err)
 		return
@@ -193,8 +193,8 @@ func handleHTTPS(conn net.Conn, forwardAddr string, allowedDomains []string, ini
 	}
 	defer forwardConn.Close()
 
-	// 将初始数据发送给目标服务器
-	_, err = forwardConn.Write(initialData)
+	// 将完整 ClientHello 发送给目标服务器
+	_, err = forwardConn.Write(fullHello)
 	if err != nil {
 		log.Printf("向目标服务器发送初始数据时出错: %v", err)
 		return
@@ -250,81 +250,115 @@ func matchDomain(host, pattern string) bool {
 	return matched
 }
 
-func readClientHello(data []byte) (*tls.ClientHelloInfo, error) {
-	reader := bytes.NewReader(data)
-	hello := &tls.ClientHelloInfo{}
+func readClientHello(conn net.Conn, firstChunk []byte) (*tls.ClientHelloInfo, []byte, error) {
+	buf := append([]byte(nil), firstChunk...)
 
-	// 跳过 TLS 记录层头部
-	reader.Seek(5, io.SeekStart)
-
-	// 读取 Handshake 消息类型
-	var handshakeType uint8
-	if err := binary.Read(reader, binary.BigEndian, &handshakeType); err != nil {
-		return nil, err
-	}
-
-	// 确保是 ClientHello 消息
-	if handshakeType != 1 {
-		return nil, fmt.Errorf("不是 ClientHello 消息")
-	}
-
-	// 跳过 Handshake 消息长度
-	reader.Seek(3, io.SeekCurrent)
-
-	// 跳过协议版本和随机数
-	reader.Seek(34, io.SeekCurrent)
-
-	// 跳过 Session ID
-	var sessionIDLength uint8
-	binary.Read(reader, binary.BigEndian, &sessionIDLength)
-	reader.Seek(int64(sessionIDLength), io.SeekCurrent)
-
-	// 跳过密码套件
-	var cipherSuitesLength uint16
-	binary.Read(reader, binary.BigEndian, &cipherSuitesLength)
-	reader.Seek(int64(cipherSuitesLength), io.SeekCurrent)
-
-	// 跳过压缩方法
-	var compressionMethodsLength uint8
-	binary.Read(reader, binary.BigEndian, &compressionMethodsLength)
-	reader.Seek(int64(compressionMethodsLength), io.SeekCurrent)
-
-	// 读取扩展部分
-	var extensionsLength uint16
-	if err := binary.Read(reader, binary.BigEndian, &extensionsLength); err != nil {
-		return nil, err
-	}
-
-	extensionsData := make([]byte, extensionsLength)
-	if _, err := io.ReadFull(reader, extensionsData); err != nil {
-		return nil, err
-	}
-
-	// 解析扩展以查找 SNI
-	for len(extensionsData) > 4 {
-		extensionType := binary.BigEndian.Uint16(extensionsData[:2])
-		extensionLength := binary.BigEndian.Uint16(extensionsData[2:4])
-		extensionData := extensionsData[4 : 4+extensionLength]
-
-		if extensionType == 0 { // Server Name Indication
-			if len(extensionData) > 2 {
-				listLength := binary.BigEndian.Uint16(extensionData[:2])
-				nameList := extensionData[2 : 2+listLength]
-				if len(nameList) > 3 {
-					nameType := nameList[0]
-					if nameType == 0 { // host_name
-						nameLength := binary.BigEndian.Uint16(nameList[1:3])
-						if len(nameList) >= int(3+nameLength) {
-							hello.ServerName = string(nameList[3 : 3+nameLength])
-							return hello, nil
-						}
-					}
-				}
-			}
+	// 至少拿到记录层头部
+	if len(buf) < 5 {
+		if err := readN(conn, &buf, 5-len(buf)); err != nil {
+			log.Printf("读取 ClientHello 记录头部失败: %v", err)
+			return nil, nil, err
 		}
-
-		extensionsData = extensionsData[4+extensionLength:]
+	}
+	// 解析记录长度
+	recordLen := int(binary.BigEndian.Uint16(buf[3:5]))
+	totalLen := 5 + recordLen
+	if recordLen == 0 {
+		log.Printf("ClientHello 记录长度为0")
+		return nil, nil, fmt.Errorf("record length = 0")
+	}
+	// 继续读到完整记录
+	if len(buf) < totalLen {
+		if err := readN(conn, &buf, totalLen-len(buf)); err != nil {
+			log.Printf("读取完整 ClientHello 失败: %v", err)
+			return nil, nil, err
+		}
 	}
 
-	return hello, nil
+	// 现在 buf 中握手层完整
+	hello := &tls.ClientHelloInfo{}
+	r := bytes.NewReader(buf[5:]) // 跳过记录头
+
+	var handshakeType uint8
+	if err := binary.Read(r, binary.BigEndian, &handshakeType); err != nil {
+		log.Printf("读取 Handshake 类型失败: %v", err)
+		return nil, nil, err
+	}
+	if handshakeType != 1 { // 1 = client_hello
+		log.Printf("不是 ClientHello 类型: %d", handshakeType)
+		return nil, nil, fmt.Errorf("不是 ClientHello")
+	}
+	// 跳过长度 3
+	r.Seek(3, io.SeekCurrent)
+	// 跳过版本(2) + 随机数(32)
+	r.Seek(34, io.SeekCurrent)
+
+	// SessionID
+	var sidLen uint8
+	binary.Read(r, binary.BigEndian, &sidLen)
+	r.Seek(int64(sidLen), io.SeekCurrent)
+
+	// CipherSuites
+	var csLen uint16
+	binary.Read(r, binary.BigEndian, &csLen)
+	r.Seek(int64(csLen), io.SeekCurrent)
+
+	// Compression
+	var compLen uint8
+	binary.Read(r, binary.BigEndian, &compLen)
+	r.Seek(int64(compLen), io.SeekCurrent)
+
+	// Extensions
+	var extLen uint16
+	if err := binary.Read(r, binary.BigEndian, &extLen); err != nil {
+		log.Printf("读取扩展长度失败: %v", err)
+		return nil, nil, err
+	}
+	extData := make([]byte, extLen)
+	if _, err := io.ReadFull(r, extData); err != nil {
+		log.Printf("读取扩展数据失败: %v", err)
+		return nil, nil, err
+	}
+
+	for pos := 0; pos+4 <= len(extData); {
+		etype := binary.BigEndian.Uint16(extData[pos : pos+2])
+		el := binary.BigEndian.Uint16(extData[pos+2 : pos+4])
+		if pos+4+int(el) > len(extData) {
+			break
+		}
+		if etype == 0 { // SNI
+			list := extData[pos+4 : pos+4+int(el)]
+			if len(list) < 2 {
+				break
+			}
+			listLen := binary.BigEndian.Uint16(list[:2])
+			if int(listLen)+2 > len(list) || listLen == 0 {
+				break
+			}
+			item := list[2:]
+			if len(item) < 3 || item[0] != 0 {
+				break
+			}
+			nameLen := binary.BigEndian.Uint16(item[1:3])
+			if int(nameLen)+3 > len(item) {
+				break
+			}
+			hello.ServerName = string(item[3 : 3+nameLen])
+			log.Printf("解析到 SNI: %s", hello.ServerName)
+			return hello, buf, nil
+		}
+		pos += 4 + int(el)
+	}
+	log.Printf("未找到 SNI")
+	return hello, buf, fmt.Errorf("未找到 SNI")
+}
+
+func readN(conn net.Conn, dst *[]byte, n int) error {
+	tmp := make([]byte, n)
+	_, err := io.ReadFull(conn, tmp)
+	if err != nil {
+		return err
+	}
+	*dst = append(*dst, tmp...)
+	return nil
 }
